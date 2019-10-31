@@ -25,6 +25,7 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/encryption.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -751,6 +752,10 @@ XLogRead(char *buf, int segsize, TimeLineID tli, XLogRecPtr startptr,
 					 errmsg("could not read from log segment %s, offset %u, length %lu: %m",
 							path, sendOff, (unsigned long) segbytes)));
 		}
+
+		/* Decrypt read xlog page */
+		if (DataEncryptionEnabled())
+			DecryptXLog(p, readbytes, sendSegNo, segbytes);
 
 		/* Update state for read */
 		recptr += readbytes;
