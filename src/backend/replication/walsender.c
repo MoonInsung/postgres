@@ -82,6 +82,8 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/encryption.h"
+#include "storage/kmgr.h"
 #include "tcop/dest.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -2365,12 +2367,14 @@ static void
 XLogRead(WALSegmentContext *segcxt, char *buf, XLogRecPtr startptr, Size count)
 {
 	char	   *p;
+	char	   *decrypt_startoff_p;
 	XLogRecPtr	recptr;
 	Size		nbytes;
 	XLogSegNo	segno;
 
 retry:
 	p = buf;
+	decrypt_startoff_p = p;
 	recptr = startptr;
 	nbytes = count;
 
@@ -2497,6 +2501,22 @@ retry:
 		sendSeg->ws_off += readbytes;
 		nbytes -= readbytes;
 		p += readbytes;
+
+		/* decrypt WAL block */
+		if (DataEncryptionEnabled())
+		{
+			int decrypt_wal_size = readbytes;
+			while (decrypt_wal_size > 0)
+			{
+				DecryptXLog(decrypt_startoff_p,
+							XLOG_BLCKSZ,
+							sendSeg->ws_segno,
+							startoff);
+				decrypt_startoff_p += XLOG_BLCKSZ;
+				decrypt_wal_size -= XLOG_BLCKSZ;
+				startoff += XLOG_BLCKSZ;
+			}
+		}
 	}
 
 	/*
