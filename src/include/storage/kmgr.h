@@ -78,4 +78,6 @@ extern void InitializeKmgr(void);
 extern const char *KmgrGetRelationEncryptionKey(void);
 extern const char *KmgrGetWALEncryptionKey(void);
 
+extern const char *GetBackendKey(void);
+
 #endif /* KMGR_H */

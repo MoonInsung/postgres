@@ -44,6 +44,10 @@ static keydata_t walEncKey[TDE_MAX_DEK_SIZE];
 /* GUC variable */
 char *cluster_passphrase_command = NULL;
 
+/* Provide backend-local temporary key */
+static bool local_tempkey_initialized = false;
+static char local_tempkey[TDE_MAX_DEK_SIZE];
+
 static int run_cluster_passphrase_command(char *buf, int size);
 static void get_kek_and_hmackey_from_passphrase(char *passphrase, char passlen,
 												keydata_t salt[TDE_KEK_DEVIRATION_SALT_SIZE],
@@ -362,4 +366,23 @@ KmgrGetWALEncryptionKey(void)
 {
 	Assert(DataEncryptionEnabled());
 	return (const char *) walEncKey;
+}
+
+const char *
+GetBackendKey(void)
+{
+	if (!local_tempkey_initialized)
+	{
+		char keybuf[TDE_MAX_DEK_SIZE];
+		int ret;
+
+		ret = pg_strong_random(keybuf, EncryptionKeySize);
+		if (!ret)
+			ereport(ERROR,
+					(errmsg("failed to generate temporary key")));
+
+		memcpy(local_tempkey, keybuf, EncryptionKeySize);
+		local_tempkey_initialized = true;
+	}
+	return local_tempkey;
 }

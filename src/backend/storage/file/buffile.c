@@ -45,6 +45,8 @@
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/encryption.h"
+#include "storage/kmgr.h"
 #include "storage/fd.h"
 #include "storage/buffile.h"
 #include "storage/buf_internals.h"
@@ -433,6 +435,41 @@ BufFileLoadBuffer(BufFile *file)
 							sizeof(file->buffer),
 							file->curOffset,
 							WAIT_EVENT_BUFFILE_READ);
+
+	if (DataEncryptionEnabled())
+	{
+		//TDE TEST START
+		int dummy_size = 0;
+		unsigned int ctr_value = 0;
+		char *enc_buf;
+		char tweak[ENC_IV_SIZE];
+
+		ctr_value = file->curOffset / 16;
+		dummy_size = file->curOffset % 16;
+
+		enc_buf = palloc0(file->nbytes + dummy_size);
+
+		memcpy(enc_buf+dummy_size, file->buffer.data, file->nbytes);
+		memset(tweak,0,ENC_IV_SIZE);
+		//memcpy(tweak, &file->curOffset, sizeof(off_t));
+
+		tweak[12] = ctr_value >> 24;
+		tweak[13] = ctr_value >> 16;
+		tweak[14] = ctr_value >> 8;
+		tweak[15] = ctr_value;
+
+		pg_decrypt(enc_buf,
+				   enc_buf,
+				   file->nbytes+dummy_size,
+				   GetBackendKey(),
+				   tweak);
+
+		memcpy(file->buffer.data,enc_buf+dummy_size,file->nbytes);
+
+		pfree(enc_buf);
+		//TDE TEST STOP
+	}
+
 	if (file->nbytes < 0)
 		file->nbytes = 0;
 	/* we choose not to advance curOffset here */
@@ -484,11 +521,49 @@ BufFileDumpBuffer(BufFile *file)
 			bytestowrite = (int) availbytes;
 
 		thisfile = file->files[file->curFile];
-		bytestowrite = FileWrite(thisfile,
-								 file->buffer.data + wpos,
-								 bytestowrite,
-								 file->curOffset,
-								 WAIT_EVENT_BUFFILE_WRITE);
+
+		if (DataEncryptionEnabled())
+		{
+			//TDE TEST START
+			int dummy_size = 0;
+			unsigned int ctr_value = 0;
+			char *enc_buf;
+			char tweak[ENC_IV_SIZE];
+
+			ctr_value = file->curOffset / 16;
+			dummy_size = file->curOffset % 16;
+
+			enc_buf = palloc0(bytestowrite + dummy_size);
+
+			memcpy(enc_buf+dummy_size, file->buffer.data+wpos,bytestowrite);
+			memset(tweak,0,ENC_IV_SIZE);
+			//memcpy(tweak, &file->curOffset, sizeof(off_t));
+
+			tweak[12] = ctr_value >> 24;
+			tweak[13] = ctr_value >> 16;
+			tweak[14] = ctr_value >> 8;
+			tweak[15] = ctr_value;
+
+			pg_encrypt(enc_buf,enc_buf,bytestowrite+dummy_size,GetBackendKey(),tweak);
+
+			bytestowrite = FileWrite(thisfile,
+									 enc_buf + dummy_size,
+									 bytestowrite,
+									 file->curOffset,
+									 WAIT_EVENT_BUFFILE_WRITE);
+
+			pfree(enc_buf);
+			//TDE TEST END`
+		}
+		else
+		{
+			bytestowrite = FileWrite(thisfile,
+									 file->buffer.data + wpos,
+									 bytestowrite,
+									 file->curOffset,
+									 WAIT_EVENT_BUFFILE_WRITE);
+		}
+
 		if (bytestowrite <= 0)
 			return;				/* failed to write */
 		file->curOffset += bytestowrite;
