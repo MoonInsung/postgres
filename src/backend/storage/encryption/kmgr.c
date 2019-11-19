@@ -373,6 +373,7 @@ GetBackendKey(void)
 {
 	if (!local_tempkey_initialized)
 	{
+		//char keybuf[TDE_MAX_DEK_SIZE]="QWERASDFZXCVQWERASDFZXCVQWERASDF";
 		char keybuf[TDE_MAX_DEK_SIZE];
 		int ret;
 

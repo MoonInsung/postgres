@@ -73,13 +73,15 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/sinval.h"
+#include "storage/encryption.h"
+#include "storage/kmgr.h"
 #include "utils/builtins.h"
 #include "utils/combocid.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relfilenodemap.h"
-
+#include "utils/hashutils.h"
 
 /* entry for a hash table we use to map from xid to our transaction state */
 typedef struct ReorderBufferTXNByIdEnt
@@ -155,6 +157,14 @@ typedef struct ReorderBufferDiskChange
  * like.
  */
 static const Size max_changes_in_memory = 4096;
+
+static uint32 write_filepath_hashval=0;
+static uint32 write_file_offset = 0;
+static char write_hash_string[8];
+
+static uint32 read_filepath_hashval=0;
+static uint32 read_file_offset = 0;
+static char read_hash_string[8];
 
 /* ---------------------------------------
  * primary reorderbuffer support routines
@@ -2286,6 +2296,8 @@ ReorderBufferSerializeTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		{
 			char		path[MAXPGPATH];
 
+			memset(path,0,MAXPGPATH);
+
 			if (fd != -1)
 				CloseTransientFile(fd);
 
@@ -2297,6 +2309,18 @@ ReorderBufferSerializeTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 			 */
 			ReorderBufferSerializedPath(path, MyReplicationSlot, txn->xid,
 										curOpenSegNo);
+
+			if (DataEncryptionEnabled())
+			{
+				uint32 a;
+				a = DatumGetUInt32(hash_any((const unsigned char *) path, MAXPGPATH));
+				if( a != write_filepath_hashval)
+				{
+					snprintf(write_hash_string, sizeof(write_hash_string), "%08x",a);
+					write_filepath_hashval = a;
+					write_file_offset = 0;
+				}
+			}
 
 			/* open segment, create it if necessary */
 			fd = OpenTransientFile(path,
@@ -2494,18 +2518,80 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_REORDER_BUFFER_WRITE);
-	if (write(fd, rb->outbuf, ondisk->size) != ondisk->size)
+
+	if (DataEncryptionEnabled())
 	{
-		int			save_errno = errno;
+		char *buf;
+		char tweak[ENC_IV_SIZE];
 
-		CloseTransientFile(fd);
+		buf = palloc0(ondisk->size);
 
-		/* if write didn't set errno, assume problem is no disk space */
-		errno = save_errno ? save_errno : ENOSPC;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write to data file for XID %u: %m",
-						txn->xid)));
+		//header
+		memset(tweak, 0, ENC_IV_SIZE);
+		memcpy(tweak, &write_file_offset, sizeof(write_file_offset));
+		memcpy(tweak+sizeof(write_file_offset), &write_hash_string, sizeof(write_hash_string));
+		pg_encrypt(rb->outbuf,
+				   buf,
+				   sizeof(ReorderBufferDiskChange),
+				   GetBackendKey(),
+				   tweak);
+
+		if (write(fd, buf, sizeof(ReorderBufferDiskChange)) != sizeof(ReorderBufferDiskChange))
+		{
+			int			save_errno = errno;
+
+			CloseTransientFile(fd);
+
+			/* if write didn't set errno, assume problem is no disk space */
+			errno = save_errno ? save_errno : ENOSPC;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to data file for XID %u: %m",
+						 txn->xid)));
+		}
+		write_file_offset += sizeof(ReorderBufferDiskChange);
+
+		//data
+		memset(tweak, 0, ENC_IV_SIZE);
+		memcpy(tweak, &write_file_offset, sizeof(write_file_offset));
+		memcpy(tweak+sizeof(write_file_offset), &write_hash_string, sizeof(write_hash_string));
+		pg_encrypt(rb->outbuf+sizeof(ReorderBufferDiskChange),
+				   buf,
+				   ondisk->size - sizeof(ReorderBufferDiskChange),
+				   GetBackendKey(),
+				   tweak);
+
+		if (write(fd, buf, ondisk->size - sizeof(ReorderBufferDiskChange)) != ondisk->size - sizeof(ReorderBufferDiskChange))
+		{
+			int			save_errno = errno;
+
+			CloseTransientFile(fd);
+
+			/* if write didn't set errno, assume problem is no disk space */
+			errno = save_errno ? save_errno : ENOSPC;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to data file for XID %u: %m",
+						 txn->xid)));
+		}
+		write_file_offset += (ondisk->size - sizeof(ReorderBufferDiskChange));
+		pfree(buf);
+	}
+	else
+	{
+		if (write(fd, rb->outbuf, ondisk->size) != ondisk->size)
+		{
+			int			save_errno = errno;
+
+			CloseTransientFile(fd);
+
+			/* if write didn't set errno, assume problem is no disk space */
+			errno = save_errno ? save_errno : ENOSPC;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to data file for XID %u: %m",
+						 txn->xid)));
+		}
 	}
 	pgstat_report_wait_end();
 
@@ -2549,6 +2635,7 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		{
 			char		path[MAXPGPATH];
 
+			memset(path,0,MAXPGPATH);
 			/* first time in */
 			if (*segno == 0)
 				XLByteToSeg(txn->first_lsn, *segno, wal_segment_size);
@@ -2561,6 +2648,18 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			 */
 			ReorderBufferSerializedPath(path, MyReplicationSlot, txn->xid,
 										*segno);
+
+			if (DataEncryptionEnabled())
+			{
+				uint32 a;
+				a = DatumGetUInt32(hash_any((const unsigned char *) path, MAXPGPATH));
+				if( a != read_filepath_hashval )
+				{
+					snprintf(read_hash_string, sizeof(read_hash_string), "%08x",a);
+					read_filepath_hashval = a;
+					read_file_offset = 0;
+				}
+			}
 
 			*fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 			if (*fd < 0 && errno == ENOENT)
@@ -2583,7 +2682,29 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		 */
 		ReorderBufferSerializeReserve(rb, sizeof(ReorderBufferDiskChange));
 		pgstat_report_wait_start(WAIT_EVENT_REORDER_BUFFER_READ);
-		readBytes = read(*fd, rb->outbuf, sizeof(ReorderBufferDiskChange));
+		if (DataEncryptionEnabled())
+		{
+			//header read
+			char *buf;
+			char tweak[ENC_IV_SIZE];
+
+			buf = palloc0(sizeof(ReorderBufferDiskChange));
+			readBytes = read(*fd, buf, sizeof(ReorderBufferDiskChange));
+			memset(tweak, 0, ENC_IV_SIZE);
+			memcpy(tweak, &read_file_offset, sizeof(read_file_offset));
+			memcpy(tweak+sizeof(read_file_offset), &read_hash_string, sizeof(read_hash_string));
+			pg_decrypt(buf,
+					   rb->outbuf,
+					   sizeof(ReorderBufferDiskChange),
+					   GetBackendKey(),
+					   tweak);
+
+			pfree(buf);
+			read_file_offset += sizeof(ReorderBufferDiskChange);
+		}
+		else
+			readBytes = read(*fd, rb->outbuf, sizeof(ReorderBufferDiskChange));
+
 		pgstat_report_wait_end();
 
 		/* eof */
@@ -2612,8 +2733,31 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		ondisk = (ReorderBufferDiskChange *) rb->outbuf;
 
 		pgstat_report_wait_start(WAIT_EVENT_REORDER_BUFFER_READ);
-		readBytes = read(*fd, rb->outbuf + sizeof(ReorderBufferDiskChange),
-						 ondisk->size - sizeof(ReorderBufferDiskChange));
+		if (DataEncryptionEnabled())
+		{
+			//data
+			char *buf;
+			char tweak[ENC_IV_SIZE];
+
+			buf = palloc0(ondisk->size - sizeof(ReorderBufferDiskChange));
+			readBytes = read(*fd, buf, ondisk->size - sizeof(ReorderBufferDiskChange));
+
+			memset(tweak, 0, ENC_IV_SIZE);
+			memcpy(tweak, &read_file_offset, sizeof(read_file_offset));
+			memcpy(tweak+sizeof(read_file_offset), &read_hash_string, sizeof(read_hash_string));
+
+			pg_decrypt(buf,
+					   rb->outbuf + sizeof(ReorderBufferDiskChange),
+					   ondisk->size - sizeof(ReorderBufferDiskChange),
+					   GetBackendKey(),
+					   tweak);
+
+			pfree(buf);
+			read_file_offset += (ondisk->size - sizeof(ReorderBufferDiskChange));
+		}
+		else
+			readBytes = read(*fd, rb->outbuf + sizeof(ReorderBufferDiskChange),
+							 ondisk->size - sizeof(ReorderBufferDiskChange));
 		pgstat_report_wait_end();
 
 		if (readBytes < 0)
