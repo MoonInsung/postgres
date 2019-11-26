@@ -755,7 +755,7 @@ XLogRead(char *buf, int segsize, TimeLineID tli, XLogRecPtr startptr,
 
 		/* Decrypt read xlog page */
 		if (DataEncryptionEnabled())
-			DecryptXLog(p, readbytes, sendSegNo, segbytes);
+			DecryptXLog(p, readbytes, sendSegNo, startoff);
 
 		/* Update state for read */
 		recptr += readbytes;
