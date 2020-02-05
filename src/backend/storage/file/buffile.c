@@ -70,6 +70,7 @@ struct BufFile
 	int			numFiles;		/* number of physical files in set */
 	/* all files except the last have length exactly MAX_PHYSICAL_FILESIZE */
 	File	   *files;			/* palloc'd array with numFiles entries */
+	File	   *ivFiles;		/* Palloc'd array with numFiles Entries */
 
 	bool		isInterXact;	/* keep open over transactions? */
 	bool		dirty;			/* does buffer need to be written? */
@@ -96,8 +97,10 @@ struct BufFile
 	PGAlignedBlock buffer;
 };
 
+static bool maybe_overwrite = true;
+
 static BufFile *makeBufFileCommon(int nfiles);
-static BufFile *makeBufFile(File firstfile);
+static BufFile *makeBufFile(File firstfile, File firstIVfile);
 static void extendBufFile(BufFile *file);
 static void BufFileLoadBuffer(BufFile *file);
 static void BufFileDumpBuffer(BufFile *file);
@@ -129,12 +132,14 @@ makeBufFileCommon(int nfiles)
  * NOTE: caller must set isInterXact if appropriate.
  */
 static BufFile *
-makeBufFile(File firstfile)
+makeBufFile(File firstfile, File firstIVfile)
 {
 	BufFile    *file = makeBufFileCommon(1);
 
 	file->files = (File *) palloc(sizeof(File));
 	file->files[0] = firstfile;
+	file->ivFiles = (File *) palloc(sizeof(File));
+	file->ivFiles[0] = firstIVfile;
 	file->readOnly = false;
 	file->fileset = NULL;
 	file->name = NULL;
@@ -149,6 +154,7 @@ static void
 extendBufFile(BufFile *file)
 {
 	File		pfile;
+	File		ivFile = NULL;
 	ResourceOwner oldowner;
 
 	/* Be sure to associate the file with the BufFile's resource owner */
@@ -156,9 +162,14 @@ extendBufFile(BufFile *file)
 	CurrentResourceOwner = file->resowner;
 
 	if (file->fileset == NULL)
-		pfile = OpenTemporaryFile(file->isInterXact);
+		pfile = OpenTemporaryFile(file->isInterXact, false);
 	else
 		pfile = MakeNewSharedSegment(file, file->numFiles);
+
+	if (DataEncryptionEnabled())
+	{
+		/* create to IV file */
+	}
 
 	Assert(pfile >= 0);
 
@@ -167,6 +178,11 @@ extendBufFile(BufFile *file)
 	file->files = (File *) repalloc(file->files,
 									(file->numFiles + 1) * sizeof(File));
 	file->files[file->numFiles] = pfile;
+
+	file->ivFiles = (File *) repalloc(file->ivFiles,
+									(file->numFiles + 1) * sizeof(File));
+	file->ivFiles[file->numFiles] = ivFile;
+
 	file->numFiles++;
 }
 
@@ -187,7 +203,7 @@ BufFileCreateTemp(bool interXact)
 {
 	BufFile    *file;
 	File		pfile;
-
+	File		ivFile = NULL;
 	/*
 	 * Ensure that temp tablespaces are set up for OpenTemporaryFile to use.
 	 * Possibly the caller will have done this already, but it seems useful to
@@ -199,10 +215,16 @@ BufFileCreateTemp(bool interXact)
 	 */
 	PrepareTempTablespaces();
 
-	pfile = OpenTemporaryFile(interXact);
+	pfile = OpenTemporaryFile(interXact, false);
 	Assert(pfile >= 0);
 
-	file = makeBufFile(pfile);
+	if (DataEncryptionEnabled())
+	{
+		/* create to IV file */
+		ivFile = OpenTemporaryFile(interXact, true);
+	}
+
+	file = makeBufFile(pfile, ivFile);
 	file->isInterXact = interXact;
 
 	return file;
@@ -266,6 +288,8 @@ BufFileCreateShared(SharedFileSet *fileset, const char *name)
 	file->name = pstrdup(name);
 	file->files = (File *) palloc(sizeof(File));
 	file->files[0] = MakeNewSharedSegment(file, 0);
+	file->ivFiles = (File *) palloc(sizeof(File));
+	file->ivFiles[0] = MakeNewSharedSegment(file,0);
 	file->readOnly = false;
 
 	return file;
@@ -398,9 +422,14 @@ BufFileClose(BufFile *file)
 	BufFileFlush(file);
 	/* close and delete the underlying file(s) */
 	for (i = 0; i < file->numFiles; i++)
+	{
 		FileClose(file->files[i]);
+		if (DataEncryptionEnabled())
+			FileClose(file->ivFiles[i]);
+	}
 	/* release the buffer space */
 	pfree(file->files);
+	pfree(file->ivFiles);
 	pfree(file);
 }
 
@@ -415,6 +444,7 @@ static void
 BufFileLoadBuffer(BufFile *file)
 {
 	File		thisfile;
+	off_t		cur_off;
 
 	/*
 	 * Advance to next component file if necessary and possible.
@@ -430,46 +460,20 @@ BufFileLoadBuffer(BufFile *file)
 	 * Read whatever we can get, up to a full bufferload.
 	 */
 	thisfile = file->files[file->curFile];
+	cur_off = file->curOffset;
+	
 	file->nbytes = FileRead(thisfile,
 							file->buffer.data,
 							sizeof(file->buffer),
-							file->curOffset,
+							cur_off,
 							WAIT_EVENT_BUFFILE_READ);
 
 	if (DataEncryptionEnabled())
-	{
-		//TDE TEST START
-		int dummy_size = 0;
-		unsigned int ctr_value = 0;
-		char *enc_buf;
-		char tweak[ENC_IV_SIZE];
-
-		ctr_value = file->curOffset / 16;
-		dummy_size = file->curOffset % 16;
-
-		enc_buf = palloc0(file->nbytes + dummy_size);
-
-		memcpy(enc_buf+dummy_size, file->buffer.data, file->nbytes);
-		memset(tweak,0,ENC_IV_SIZE);
-		//memcpy(tweak, &file->curOffset, sizeof(off_t));
-
-		tweak[12] = ctr_value >> 24;
-		tweak[13] = ctr_value >> 16;
-		tweak[14] = ctr_value >> 8;
-		tweak[15] = ctr_value;
-
-		pg_decrypt(enc_buf,
-				   enc_buf,
-				   file->nbytes+dummy_size,
-				   GetBackendKey(),
-				   tweak);
-
-		memcpy(file->buffer.data,enc_buf+dummy_size,file->nbytes);
-
-		pfree(enc_buf);
-		//TDE TEST STOP
-	}
-
+		DecryptionTempBlock(file->buffer.data,
+							file->buffer.data,
+							file->nbytes,
+							file->curOffset,
+							file->ivFiles[file->curFile]);
 	if (file->nbytes < 0)
 		file->nbytes = 0;
 	/* we choose not to advance curOffset here */
@@ -523,46 +527,18 @@ BufFileDumpBuffer(BufFile *file)
 		thisfile = file->files[file->curFile];
 
 		if (DataEncryptionEnabled())
-		{
-			//TDE TEST START
-			int dummy_size = 0;
-			unsigned int ctr_value = 0;
-			char *enc_buf;
-			char tweak[ENC_IV_SIZE];
+			EncryptionTempBlock(file->buffer.data + wpos,
+								file->buffer.data + wpos,
+								bytestowrite,
+								file->curOffset,
+								file->ivFiles[file->curFile],
+								maybe_overwrite);
 
-			ctr_value = file->curOffset / 16;
-			dummy_size = file->curOffset % 16;
-
-			enc_buf = palloc0(bytestowrite + dummy_size);
-
-			memcpy(enc_buf+dummy_size, file->buffer.data+wpos,bytestowrite);
-			memset(tweak,0,ENC_IV_SIZE);
-			//memcpy(tweak, &file->curOffset, sizeof(off_t));
-
-			tweak[12] = ctr_value >> 24;
-			tweak[13] = ctr_value >> 16;
-			tweak[14] = ctr_value >> 8;
-			tweak[15] = ctr_value;
-
-			pg_encrypt(enc_buf,enc_buf,bytestowrite+dummy_size,GetBackendKey(),tweak);
-
-			bytestowrite = FileWrite(thisfile,
-									 enc_buf + dummy_size,
-									 bytestowrite,
-									 file->curOffset,
-									 WAIT_EVENT_BUFFILE_WRITE);
-
-			pfree(enc_buf);
-			//TDE TEST END`
-		}
-		else
-		{
-			bytestowrite = FileWrite(thisfile,
-									 file->buffer.data + wpos,
-									 bytestowrite,
-									 file->curOffset,
-									 WAIT_EVENT_BUFFILE_WRITE);
-		}
+		bytestowrite = FileWrite(thisfile,
+								 file->buffer.data + wpos,
+								 bytestowrite,
+								 file->curOffset,
+								 WAIT_EVENT_BUFFILE_WRITE);
 
 		if (bytestowrite <= 0)
 			return;				/* failed to write */
@@ -579,19 +555,31 @@ BufFileDumpBuffer(BufFile *file)
 	 * logical file position, ie, original value + pos, in case that is less
 	 * (as could happen due to a small backwards seek in a dirty buffer!)
 	 */
-	file->curOffset -= (file->nbytes - file->pos);
-	if (file->curOffset < 0)	/* handle possible segment crossing */
+	if (DataEncryptionEnabled() && file->nbytes != file->pos) 
 	{
-		file->curFile--;
-		Assert(file->curFile >= 0);
-		file->curOffset += MAX_PHYSICAL_FILESIZE;
+		file->curOffset -= bytestowrite;
+		DecryptionTempBlock(file->buffer.data,
+							file->buffer.data,
+							bytestowrite,
+							file->curOffset,
+							file->ivFiles[file->curFile]);
 	}
+	else
+	{
+		file->curOffset -= (file->nbytes - file->pos);
+		if (file->curOffset < 0)	/* handle possible segment crossing */
+		{
+			file->curFile--;
+			Assert(file->curFile >= 0);
+			file->curOffset += MAX_PHYSICAL_FILESIZE;
+		}
 
-	/*
-	 * Now we can set the buffer empty without changing the logical position
-	 */
-	file->pos = 0;
-	file->nbytes = 0;
+		/*
+		 * Now we can set the buffer empty without changing the logical position
+		 */
+		file->pos = 0;
+		file->nbytes = 0;
+	}
 }
 
 /*
@@ -607,6 +595,7 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
 
 	if (file->dirty)
 	{
+		off_t ori_off = file->curOffset;
 		if (BufFileFlush(file) != 0)
 			return 0;			/* could not flush... */
 		Assert(!file->dirty);
@@ -617,19 +606,31 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
 		if (file->pos >= file->nbytes)
 		{
 			/* Try to load more data into buffer. */
-			file->curOffset += file->pos;
-			file->pos = 0;
-			file->nbytes = 0;
-			BufFileLoadBuffer(file);
-			if (file->nbytes <= 0)
-				break;			/* no more data available */
+			if (!DataEncryptionEnabled() || file->pos % BLCKSZ == 0)
+			{
+				file->curOffset += file->pos;
+				file->pos = 0;
+				file->nbytes = 0;
+				BufFileLoadBuffer(file);
+				/* no more data available */
+				if (file->nbytes <= 0)
+					break;
+			}
+			else
+			{
+				int check_before_nbytes = file->nbytes;
+				BufFileLoadBuffer(file);
+
+				if (check_before_nbytes == file->nbytes)
+					break;
+			}
 		}
 
 		nthistime = file->nbytes - file->pos;
 		if (nthistime > size)
 			nthistime = size;
 		Assert(nthistime > 0);
-
+		
 		memcpy(ptr, file->buffer.data + file->pos, nthistime);
 
 		file->pos += nthistime;
@@ -799,9 +800,19 @@ BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 		return EOF;
 	/* Seek is OK! */
 	file->curFile = newFile;
-	file->curOffset = newOffset;
-	file->pos = 0;
-	file->nbytes = 0;
+
+	if (DataEncryptionEnabled())
+	{
+		file->pos = newOffset % BLCKSZ;
+		file->curOffset = newOffset - file->pos;
+		BufFileLoadBuffer(file);
+	}
+	else
+	{
+		file->curOffset = newOffset;
+		file->pos = 0;
+		file->nbytes = 0;
+	}
 	return 0;
 }
 

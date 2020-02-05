@@ -41,12 +41,11 @@ static keydata_t keyEncKey[TDE_KEK_SIZE];
 static keydata_t relEncKey[TDE_MAX_DEK_SIZE];
 static keydata_t walEncKey[TDE_MAX_DEK_SIZE];
 
+/* Variable make from boot timing */
+static keydata_t tmpEncKey[TDE_MAX_DEK_SIZE];
+
 /* GUC variable */
 char *cluster_passphrase_command = NULL;
-
-/* Provide backend-local temporary key */
-static bool local_tempkey_initialized = false;
-static char local_tempkey[TDE_MAX_DEK_SIZE];
 
 static int run_cluster_passphrase_command(char *buf, int size);
 static void get_kek_and_hmackey_from_passphrase(char *passphrase, char passlen,
@@ -295,6 +294,10 @@ InitializeKmgr(void)
 	if (unwrapped_size != EncryptionKeySize)
 		elog(ERROR, "unwrapped WAL encryptoin key size is invalid, got %d expected %d",
 			 unwrapped_size, EncryptionKeySize);
+
+	if (!pg_strong_random(tmpEncKey, EncryptionKeySize))
+		ereport(ERROR,
+			    (errmsg("failed to generate temp file key")));
 }
 
  /*
@@ -369,21 +372,8 @@ KmgrGetWALEncryptionKey(void)
 }
 
 const char *
-GetBackendKey(void)
+KmgrGetTempFileEncryptionKey(void)
 {
-	if (!local_tempkey_initialized)
-	{
-		//char keybuf[TDE_MAX_DEK_SIZE]="QWERASDFZXCVQWERASDFZXCVQWERASDF";
-		char keybuf[TDE_MAX_DEK_SIZE];
-		int ret;
-
-		ret = pg_strong_random(keybuf, EncryptionKeySize);
-		if (!ret)
-			ereport(ERROR,
-					(errmsg("failed to generate temporary key")));
-
-		memcpy(local_tempkey, keybuf, EncryptionKeySize);
-		local_tempkey_initialized = true;
-	}
-	return local_tempkey;
+	Assert(DataEncryptionEnabled());
+	return (const char *) tmpEncKey;
 }

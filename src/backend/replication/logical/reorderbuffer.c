@@ -2533,7 +2533,7 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		pg_encrypt(rb->outbuf,
 				   buf,
 				   sizeof(ReorderBufferDiskChange),
-				   GetBackendKey(),
+				   KmgrGetRelationEncryptionKey(),
 				   tweak);
 
 		if (write(fd, buf, sizeof(ReorderBufferDiskChange)) != sizeof(ReorderBufferDiskChange))
@@ -2558,7 +2558,7 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		pg_encrypt(rb->outbuf+sizeof(ReorderBufferDiskChange),
 				   buf,
 				   ondisk->size - sizeof(ReorderBufferDiskChange),
-				   GetBackendKey(),
+				   KmgrGetTempFileEncryptionKey(),
 				   tweak);
 
 		if (write(fd, buf, ondisk->size - sizeof(ReorderBufferDiskChange)) != ondisk->size - sizeof(ReorderBufferDiskChange))
@@ -2696,7 +2696,7 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			pg_decrypt(buf,
 					   rb->outbuf,
 					   sizeof(ReorderBufferDiskChange),
-					   GetBackendKey(),
+					   KmgrGetTempFileEncryptionKey(),
 					   tweak);
 
 			pfree(buf);
@@ -2749,7 +2749,7 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			pg_decrypt(buf,
 					   rb->outbuf + sizeof(ReorderBufferDiskChange),
 					   ondisk->size - sizeof(ReorderBufferDiskChange),
-					   GetBackendKey(),
+					   KmgrGetTempFileEncryptionKey(),
 					   tweak);
 
 			pfree(buf);

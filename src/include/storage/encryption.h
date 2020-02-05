@@ -16,6 +16,7 @@
 #include "storage/bufpage.h"
 #include "storage/enc_cipher.h"
 #include "storage/enc_common.h"
+#include "storage/fd.h"
 
 #define DataEncryptionEnabled() \
 	(data_encryption_cipher > TDE_ENCRYPTION_OFF)
@@ -51,5 +52,11 @@ extern char *EncryptXLog(char *page, Size nbytes, XLogSegNo segno,
 						uint32 offset);
 extern void DecryptXLog(char *page, Size nbytes, XLogSegNo segno,
 						uint32 offset);
+
+/* bufenc.c */
+extern void EncryptionTempBlock(const char *input, char *output, int size,
+								off_t curOffset, File ivFile, bool newIV);
+extern void DecryptionTempBlock(const char *input, char *output, int size,
+								off_t curOffset, File ifVile);
 
 #endif							/* ENCRYPTION_H */

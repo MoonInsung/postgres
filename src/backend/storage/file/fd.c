@@ -301,7 +301,7 @@ static File AllocateVfd(void);
 static void FreeVfd(File file);
 
 static int	FileAccess(File file);
-static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError);
+static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError, bool ivFile);
 static bool reserveAllocatedDesc(void);
 static int	FreeDesc(AllocateDesc *desc);
 
@@ -1459,7 +1459,7 @@ PathNameDeleteTemporaryDir(const char *dirname)
  * case, the file is removed when the File is explicitly closed.
  */
 File
-OpenTemporaryFile(bool interXact)
+OpenTemporaryFile(bool interXact, bool ivFile)
 {
 	File		file = 0;
 
@@ -1484,7 +1484,7 @@ OpenTemporaryFile(bool interXact)
 		Oid			tblspcOid = GetNextTempTableSpace();
 
 		if (OidIsValid(tblspcOid))
-			file = OpenTemporaryFileInTablespace(tblspcOid, false);
+			file = OpenTemporaryFileInTablespace(tblspcOid, false, ivFile);
 	}
 
 	/*
@@ -1496,7 +1496,7 @@ OpenTemporaryFile(bool interXact)
 		file = OpenTemporaryFileInTablespace(MyDatabaseTableSpace ?
 											 MyDatabaseTableSpace :
 											 DEFAULTTABLESPACE_OID,
-											 true);
+											 true, ivFile);
 
 	/* Mark it for deletion at close and temporary file size limit */
 	VfdCache[file].fdstate |= FD_DELETE_AT_CLOSE | FD_TEMP_FILE_LIMIT;
@@ -1537,7 +1537,7 @@ TempTablespacePath(char *path, Oid tablespace)
  * Subroutine for OpenTemporaryFile, which see for details.
  */
 static File
-OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError, bool ivFile)
 {
 	char		tempdirpath[MAXPGPATH];
 	char		tempfilepath[MAXPGPATH];
@@ -1549,8 +1549,13 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
 	 * Generate a tempfile name that should be unique within the current
 	 * database instance.
 	 */
-	snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s%d.%ld",
-			 tempdirpath, PG_TEMP_FILE_PREFIX, MyProcPid, tempFileCounter++);
+	if( !ivFile )
+		snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s%d.%ld",
+				 tempdirpath, PG_TEMP_FILE_PREFIX, MyProcPid, tempFileCounter++);
+	else
+		snprintf(tempfilepath, sizeof(tempfilepath), "%s/%s%d.%ld_IV",
+				 tempdirpath, PG_TEMP_FILE_PREFIX, MyProcPid, tempFileCounter-1);
+
 
 	/*
 	 * Open the file.  Note: we don't use O_EXCL, in case there is an orphaned
