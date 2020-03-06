@@ -162,14 +162,14 @@ extendBufFile(BufFile *file)
 	CurrentResourceOwner = file->resowner;
 
 	if (file->fileset == NULL)
+	{
 		pfile = OpenTemporaryFile(file->isInterXact, false);
+		
+		if (DataEncryptionEnabled())
+			ivFile = OpenTemporaryFile(file->isInterXact, true);
+	}
 	else
 		pfile = MakeNewSharedSegment(file, file->numFiles);
-
-	if (DataEncryptionEnabled())
-	{
-		/* create to IV file */
-	}
 
 	Assert(pfile >= 0);
 
@@ -179,9 +179,12 @@ extendBufFile(BufFile *file)
 									(file->numFiles + 1) * sizeof(File));
 	file->files[file->numFiles] = pfile;
 
-	file->ivFiles = (File *) repalloc(file->ivFiles,
-									(file->numFiles + 1) * sizeof(File));
-	file->ivFiles[file->numFiles] = ivFile;
+	if (ivFile != NULL)
+	{
+		file->ivFiles = (File *) repalloc(file->ivFiles,
+										(file->numFiles + 1) * sizeof(File));
+		file->ivFiles[file->numFiles] = ivFile;
+	}
 
 	file->numFiles++;
 }
